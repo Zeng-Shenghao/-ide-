@@ -1,8 +1,21 @@
-# 如何在 Trae 中开启或者关闭模型的思考模式，以下是我的方法，明明很简单，官方就是不愿意做一个功能
+# 如何在 Trae、Cursor、Windsurf 等 AI IDE 中开启或关闭模型的思考模式：一个通用本地代理方案
 
-最近我在 Trae 里接 GLM-5.1 / Coding Plan 的时候，经常遇到一个问题：模型思考时间过长，最后导致断连、超时，或者任务卡住。
+最近我在 Trae 这类 AI IDE 里接入第三方大模型时，遇到一个比较烦的问题：有些模型默认开启 Thinking / 思考模式，模型会长时间分析，最后导致断连、超时，或者任务卡住。
 
-本质原因很简单：有些模型默认开启 Thinking / 思考模式，但是 Trae 的自定义模型界面里并没有给我们提供一个地方去传类似：
+这个问题不只可能出现在 Trae 里，像 Cursor、Windsurf、Cline、Roo Code 或其他支持自定义 OpenAI 兼容接口的 AI IDE / AI 编程工具，也可能遇到类似情况。
+
+本质原因很简单：
+
+很多 AI IDE 只给我们提供了这些基础配置：
+
+* API 地址
+* 模型 ID
+* API Key
+* 上下文长度
+* 最大输出
+* 工具调用轮次
+
+但是它们往往没有提供一个地方，让我们自由传递额外请求参数，比如：
 
 ```json
 {
@@ -12,28 +25,54 @@
 }
 ```
 
-这种额外参数。
+或者类似：
 
-所以我的解决方案是：**在本机启动一个很轻量的本地代理，让 Trae 先请求本地代理，再由本地代理转发到真正的模型 API，并自动帮我们注入开启或关闭思考模式的参数。**
+```json
+{
+  "reasoning_effort": "low"
+}
+```
 
-## 一、原理
+所以我的解决方案是：**在本机启动一个轻量级本地代理，让 AI IDE 先请求本地代理，再由本地代理转发到真正的模型 API，并在转发时自动注入开启或关闭思考模式的参数。**
+
+## 一、适用场景
+
+这个方法适合以下情况：
+
+1. 你的 AI IDE 支持自定义 OpenAI Chat Completions API；
+2. 你的模型服务支持额外参数控制思考模式；
+3. AI IDE 本身没有提供填写额外请求体的地方；
+4. 你想控制模型是“快速回答”还是“深度思考”；
+5. 你想减少长时间思考导致的断连、超时、卡死问题。
+
+例如：
+
+```text
+Trae / Cursor / Windsurf / Cline / Roo Code
+        ↓
+本地代理
+        ↓
+模型官方 API
+```
+
+## 二、原理
 
 原本的请求链路是：
 
 ```text
-Trae → 模型官方 API
+AI IDE → 模型官方 API
 ```
 
 现在改成：
 
 ```text
-Trae → 本地代理 → 模型官方 API
+AI IDE → 本地代理 → 模型官方 API
 ```
 
-例如：
+以 GLM-5.1 Coding Plan 为例：
 
 ```text
-Trae
+AI IDE
   ↓
 http://127.0.0.1:18080/v1/chat/completions
   ↓
@@ -46,18 +85,18 @@ GLM-5.1
 
 这样做的好处是：
 
-1. 不需要修改 Trae 本体；
+1. 不需要修改 AI IDE 本体；
 2. 不需要等官方加功能；
 3. 可以自己控制思考模式；
 4. 可以顺便限制最大输出，减少超时和断连；
-5. Trae 仍然按照 OpenAI Chat Completions 格式调用。
+5. 仍然保持 OpenAI Chat Completions 格式，兼容性比较好。
 
-## 二、准备一个本地代理文件
+## 三、准备本地代理文件
 
 在桌面新建一个文件夹，比如：
 
 ```text
-glm-proxy
+ai-ide-thinking-proxy
 ```
 
 然后在里面新建一个文件：
@@ -76,20 +115,23 @@ from fastapi.responses import Response, StreamingResponse, JSONResponse
 
 app = FastAPI()
 
-# GLM Coding Plan 官方地址
+# 上游模型服务地址
+# 这里以 GLM Coding Plan 为例
 UPSTREAM = os.getenv(
-    "GLM_UPSTREAM",
+    "UPSTREAM",
     "https://open.bigmodel.cn/api/coding/paas/v4"
 )
 
 # 模型 ID
-FORCE_MODEL = os.getenv("GLM_FORCE_MODEL", "glm-5.1")
+FORCE_MODEL = os.getenv("FORCE_MODEL", "glm-5.1")
 
-# 思考模式：disabled = 关闭思考；enabled = 开启思考
-THINKING_TYPE = os.getenv("GLM_THINKING", "disabled")
+# 思考模式：
+# disabled = 关闭思考
+# enabled = 开启思考
+THINKING_TYPE = os.getenv("THINKING_TYPE", "disabled")
 
 # 最大输出 token，建议先保守一点，避免超时
-MAX_TOKENS = int(os.getenv("GLM_MAX_TOKENS", "8000"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8000"))
 
 
 @app.get("/v1/models")
@@ -100,7 +142,7 @@ async def models():
             {
                 "id": FORCE_MODEL,
                 "object": "model",
-                "owned_by": "zhipu"
+                "owned_by": "custom"
             }
         ]
     })
@@ -110,10 +152,11 @@ async def models():
 async def chat_completions(request: Request):
     body = await request.json()
 
-    # 强制模型
+    # 强制模型 ID，避免 AI IDE 传错
     body["model"] = FORCE_MODEL
 
     # 核心：注入思考模式参数
+    # 这里以 GLM 的 thinking.type 为例
     body["thinking"] = {
         "type": THINKING_TYPE
     }
@@ -161,12 +204,12 @@ async def chat_completions(request: Request):
     )
 ```
 
-## 三、安装依赖并启动
+## 四、安装依赖并启动
 
 Windows PowerShell 进入这个文件夹：
 
 ```powershell
-cd "$env:USERPROFILE\Desktop\glm-proxy"
+cd "$env:USERPROFILE\Desktop\ai-ide-thinking-proxy"
 ```
 
 安装依赖：
@@ -189,41 +232,47 @@ Uvicorn running on http://127.0.0.1:18080
 
 说明成功了。
 
-注意：这个窗口不要关。关了之后，Trae 就连不上本地代理了。
+注意：这个窗口不要关。关了之后，AI IDE 就连不上本地代理了。
 
-## 四、Trae 里怎么填
+## 五、AI IDE 里怎么填
 
-在 Trae 的自定义模型配置里这样填：
+只要你的 AI IDE 支持 OpenAI Chat Completions 格式，大概都可以这样填。
 
-| 配置项     | 填写                            |
-| ------- | ----------------------------- |
-| API 格式  | OpenAI Chat Completions 格式    |
-| 自定义请求地址 | `http://127.0.0.1:18080/v1`   |
-| 完整 URL  | 关闭                            |
-| 模型 ID   | `glm-5.1`                     |
-| API 密钥  | 填你的 GLM / Coding Plan API Key |
-| 多模态     | 关闭                            |
-| 模型展示名称  | GLM-5.1 Fast                  |
-| 输出上下文   | 建议 8000                       |
-| 工具调用轮次  | 建议 30                         |
+以 Trae 为例：
 
-这里注意：Trae 里不要再填智谱官方的 URL，而是填本地代理地址：
+| 配置项     | 填写                          |
+| ------- | --------------------------- |
+| API 格式  | OpenAI Chat Completions 格式  |
+| 自定义请求地址 | `http://127.0.0.1:18080/v1` |
+| 完整 URL  | 关闭                          |
+| 模型 ID   | `glm-5.1`                   |
+| API 密钥  | 填你的模型服务 API Key             |
+| 多模态     | 按模型实际情况选择                   |
+| 模型展示名称  | 自定义，比如 `GLM-5.1 Fast`       |
+| 输出上下文   | 建议先填 8000                   |
+| 工具调用轮次  | 建议先填 30                     |
+
+重点是：AI IDE 里不要直接填模型官方 URL，而是填本地代理地址：
 
 ```text
 http://127.0.0.1:18080/v1
 ```
 
-因为现在是 Trae 先请求本地代理，再由本地代理转发到智谱官方 API。
+因为现在是：
 
-## 五、如何关闭思考模式
+```text
+AI IDE → 本地代理 → 模型官方 API
+```
+
+## 六、如何关闭思考模式
 
 默认代码里这一行就是关闭思考：
 
 ```python
-THINKING_TYPE = os.getenv("GLM_THINKING", "disabled")
+THINKING_TYPE = os.getenv("THINKING_TYPE", "disabled")
 ```
 
-也就是说，直接启动：
+所以直接启动：
 
 ```powershell
 python -m uvicorn app:app --host 127.0.0.1 --port 18080
@@ -237,14 +286,14 @@ python -m uvicorn app:app --host 127.0.0.1 --port 18080
 * 小 bug 修复；
 * 简单解释报错；
 * 不想让模型长时间分析；
-* 避免 Trae 里断连或超时。
+* 避免 AI IDE 里断连或超时。
 
-## 六、如何开启思考模式
+## 七、如何开启思考模式
 
 如果你想开启思考模式，可以在 PowerShell 里这样启动：
 
 ```powershell
-$env:GLM_THINKING="enabled"
+$env:THINKING_TYPE="enabled"
 python -m uvicorn app:app --host 127.0.0.1 --port 18080
 ```
 
@@ -258,11 +307,11 @@ python -m uvicorn app:app --host 127.0.0.1 --port 18080
 如果后面想重新关闭，可以改回：
 
 ```powershell
-$env:GLM_THINKING="disabled"
+$env:THINKING_TYPE="disabled"
 python -m uvicorn app:app --host 127.0.0.1 --port 18080
 ```
 
-## 七、端口被占用怎么办
+## 八、端口被占用怎么办
 
 如果启动时报这个错误：
 
@@ -283,23 +332,69 @@ WinError 10048
 python -m uvicorn app:app --host 127.0.0.1 --port 18080
 ```
 
-Trae 里就填：
+AI IDE 里就填：
 
 ```text
 http://127.0.0.1:18080/v1
 ```
 
-如果你换成 `19090`，那 Trae 里也要对应改成：
+如果你换成 `19090`，那 AI IDE 里也要对应改成：
 
 ```text
 http://127.0.0.1:19090/v1
 ```
 
-总之，启动端口和 Trae 里填写的端口必须一致。
+总之，启动端口和 AI IDE 里填写的端口必须一致。
 
-## 八、一些建议配置
+## 九、不同模型的参数可能不一样
 
-如果你经常因为模型想太久而断连，我建议先这样配：
+这篇文章里的代码主要以 GLM 的参数为例：
+
+```json
+{
+  "thinking": {
+    "type": "disabled"
+  }
+}
+```
+
+但不同模型服务的思考参数可能不一样。
+
+有些模型可能使用：
+
+```json
+{
+  "reasoning_effort": "low"
+}
+```
+
+或者：
+
+```json
+{
+  "reasoning_effort": "high"
+}
+```
+
+所以如果你用的不是 GLM，需要根据你所使用模型的 API 文档修改这一段：
+
+```python
+body["thinking"] = {
+    "type": THINKING_TYPE
+}
+```
+
+比如你想改成 `reasoning_effort`，可以改成类似：
+
+```python
+body["reasoning_effort"] = os.getenv("REASONING_EFFORT", "low")
+```
+
+本质都是一样的：**AI IDE 不给填的参数，我们通过本地代理在转发时补上。**
+
+## 十、建议配置
+
+如果你经常因为模型想太久而断连，建议先这样配：
 
 | 项目     | 建议              |
 | ------ | --------------- |
@@ -317,21 +412,22 @@ http://127.0.0.1:19090/v1
 
 这样可以明显降低模型卡死、超时、断连的概率。
 
-## 九、注意事项
+## 十一、注意事项
 
-1. 这个方法只是本地转发，不是修改 Trae 本体。
-2. API Key 仍然是从 Trae 传到本地代理，再转发给模型官方接口。
+1. 这个方法只是本地转发，不是修改 AI IDE 本体。
+2. API Key 仍然是从 AI IDE 传到本地代理，再转发给模型官方接口。
 3. 建议只监听 `127.0.0.1`，不要改成 `0.0.0.0`，避免局域网其他设备访问。
-4. 不同模型的思考参数不一定一样。GLM 是 `thinking.type`，其他模型可能是 `reasoning_effort` 或其他字段。
+4. 不同模型的思考参数不一定一样，需要根据模型文档调整。
 5. 如果你用的不是 GLM-5.1，需要自己改 `FORCE_MODEL` 和上游 API 地址。
+6. 如果你想更安全，可以只在自己电脑本地使用，不要把这个代理暴露到公网。
 
-## 十、总结
+## 十二、总结
 
 这个方法的核心就是一句话：
 
-**Trae 没有提供思考模式开关，那就用本地代理在请求转发时自动补上参数。**
+**AI IDE 没有提供思考模式开关，那就用本地代理在请求转发时自动补上参数。**
 
-关闭思考：
+以 GLM 为例，关闭思考：
 
 ```json
 {
@@ -351,5 +447,6 @@ http://127.0.0.1:19090/v1
 }
 ```
 
-其实功能很简单，官方完全可以在自定义模型界面里加一个“额外请求体 / 自定义参数 / 思考模式开关”。在官方支持之前，这个本地代理方案算是一个比较简单、可控、可复用的临时解决方案。
+其实这个功能很简单，官方完全可以在自定义模型界面里加一个“额外请求体 / 自定义参数 / 思考模式开关”。
 
+在官方支持之前，这个本地代理方案算是一个比较简单、可控、可复用的临时解决方案。不只适用于 Trae，也适用于其他支持 OpenAI 兼容自定义 API 的 AI IDE。
